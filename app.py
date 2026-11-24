@@ -1,11 +1,11 @@
 """
-Upwork Job Alerts — polls the Upwork MCP server and emails you every new job
-that matches your tech stack (title, description, budget, client location,
+Upwork Job Alerts — polls the Upwork MCP server and emails you every new job that
+matches your keywords and filters (title, description, budget, client location,
 client spend, payment verification, job link).
 
 Run:  python app.py   then open http://localhost:5050 and click "Connect Upwork".
-No API token needed — you sign in to Upwork in your browser (OAuth), and the
-app stores + auto-refreshes the session in jobs.db.
+Keywords, filters, email and schedule are all edited in the dashboard; everything
+(including the Upwork login) is stored in jobs.db, so a restart never logs you out.
 """
 import asyncio
 import html
@@ -14,7 +14,6 @@ import logging
 import os
 import re
 import smtplib
-import sqlite3
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -23,25 +22,23 @@ from email.message import EmailMessage
 from urllib.parse import urlsplit, urlunsplit
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from dotenv import load_dotenv
-from flask import Flask, jsonify, redirect, render_template_string, request
+from flask import Flask, abort, jsonify, redirect, render_template, request
 from mcp import ClientSession
 from mcp.client.auth import OAuthClientProvider
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
 
-load_dotenv()
+import db
+import settings as cfg
+from db import meta_del, meta_get, meta_set
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("upwork-alerts")
 
 
 # --------------------------------------------------------------------------- #
-# Config
+# Static config (server-level; everything else lives in the UI-editable settings)
 # --------------------------------------------------------------------------- #
-def _bool(name, default=False):
-    return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
-
-
 MCP_URL = os.getenv("UPWORK_MCP_URL", "https://mcp.upwork.com/mcp")
 ORG_UID = os.getenv("UPWORK_ORG_UID", "")  # optional; auto-detected (Freelancer account)
 
@@ -49,37 +46,18 @@ PORT = int(os.getenv("PORT", "5050"))  # not 5000: macOS AirPlay uses it
 # Where your browser reaches this app; Upwork redirects back to PUBLIC_URL/oauth/callback
 PUBLIC_URL = os.getenv("PUBLIC_URL", f"http://localhost:{PORT}").rstrip("/")
 REDIRECT_URI = f"{PUBLIC_URL}/oauth/callback"
-
-SEARCHES = [s.strip() for s in os.getenv(
-    "JOB_SEARCHES",
-    "Django,FastAPI,Python backend,REST API,HubSpot,Salesforce integration,Zoho,RAG,LangChain",
-).split(",") if s.strip()]
-
-# Account safety: be a light, human-like API user. Never poll faster than MIN_POLL_SECONDS.
-MIN_POLL_SECONDS = 300
-POLL_SECONDS = max(int(os.getenv("POLL_SECONDS", "600")), MIN_POLL_SECONDS)
-SEARCH_DELAY_SECONDS = max(float(os.getenv("SEARCH_DELAY_SECONDS", "3")), 1.0)  # pause between searches
 HOST = os.getenv("HOST", "127.0.0.1")  # dashboard only reachable from this computer
-MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "24"))
-VERIFIED_ONLY = _bool("VERIFIED_PAYMENT_ONLY", False)
-MIN_CLIENT_SPEND = float(os.getenv("MIN_CLIENT_SPEND", "0"))
-EMAIL_ON_FIRST_RUN = _bool("EMAIL_ON_FIRST_RUN", False)
-
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
-MAIL_FROM = os.getenv("MAIL_FROM", "") or SMTP_USER
-MAIL_TO = os.getenv("MAIL_TO", "") or SMTP_USER
-
-DB_PATH = os.getenv("DB_PATH", "jobs.db")
+EMAIL_ON_FIRST_RUN = os.getenv("EMAIL_ON_FIRST_RUN", "false").strip().lower() in ("1", "true", "yes", "on")
 
 app = Flask(__name__)
 _poll_lock = threading.Lock()
-STATE = {"last_poll": None, "last_error": None, "last_found": 0, "emails_sent": 0,
-         "paused_until": None}
-_org_cache = {"uid": ORG_UID}
+STATE = {"last_poll": meta_get("last_poll"), "last_error": None,
+         "last_found": int(meta_get("last_found", 0) or 0), "paused_until": None,
+         "polling": False, "last_result": None}
+_org_cache = {"uid": ORG_UID or meta_get("org_uid") or ""}
 _backoff = {"until": 0.0, "seconds": 0}
+_auth_fail = {"n": 0}
+scheduler = BackgroundScheduler(timezone="UTC")
 
 
 class RateLimited(Exception):
@@ -89,53 +67,6 @@ class RateLimited(Exception):
 def is_rate_limit(text):
     t = str(text).lower()
     return "429" in t or "rate limit" in t or "too many requests" in t or "throttl" in t
-
-
-# --------------------------------------------------------------------------- #
-# Seen-jobs store (SQLite)
-# --------------------------------------------------------------------------- #
-def db():
-    con = sqlite3.connect(DB_PATH)
-    con.execute("CREATE TABLE IF NOT EXISTS seen (job_id TEXT PRIMARY KEY, title TEXT, seen_at TEXT)")
-    con.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
-    return con
-
-
-def meta_get(key):
-    with db() as con:
-        row = con.execute("SELECT v FROM meta WHERE k=?", (key,)).fetchone()
-    return row[0] if row else None
-
-
-def meta_set(key, value):
-    with db() as con:
-        con.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, value))
-
-
-def meta_del(*keys):
-    with db() as con:
-        con.executemany("DELETE FROM meta WHERE k=?", [(k,) for k in keys])
-
-
-def is_seen(con, job_id):
-    return con.execute("SELECT 1 FROM seen WHERE job_id=?", (job_id,)).fetchone() is not None
-
-
-def mark_seen(con, job):
-    # Only the job ID is kept (for de-duplication) — no job content is stored locally.
-    con.execute(
-        "INSERT OR IGNORE INTO seen VALUES (?,?,?)",
-        (job["id"], "", datetime.now(timezone.utc).isoformat()),
-    )
-    con.commit()
-
-
-def prune_seen(con):
-    # Jobs older than MAX_AGE_HOURS are filtered out anyway, so their IDs aren't needed.
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=MAX_AGE_HOURS + 6)
-    con.execute("DELETE FROM seen WHERE seen_at < ?", (cutoff.isoformat(),))
-    con.execute("UPDATE seen SET title='' WHERE title<>''")  # scrub titles stored by older versions
-    con.commit()
 
 
 # --------------------------------------------------------------------------- #
@@ -153,6 +84,13 @@ class DBTokenStorage:
         return OAuthToken.model_validate_json(raw) if raw else None
 
     async def set_tokens(self, tokens):
+        # A refresh response often omits refresh_token (it is only rotated sometimes).
+        # Never overwrite a good stored refresh token with nothing — that is what
+        # used to log the app out after the first access-token expiry.
+        if not tokens.refresh_token:
+            old = await self.get_tokens()
+            if old and old.refresh_token:
+                tokens = tokens.model_copy(update={"refresh_token": old.refresh_token})
         meta_set("oauth_tokens", tokens.model_dump_json())
         meta_set("oauth_expires_at", str(time.time() + tokens.expires_in) if tokens.expires_in else "")
 
@@ -189,18 +127,35 @@ def make_auth(redirect_handler, callback_handler):
     )
 
 
+# Scheduled polls can't open a browser. If the SDK decides a full login is needed
+# (refresh failed), we do NOT delete the stored tokens: the failure may be transient
+# (network, Upwork 5xx) and the next poll will refresh fine. We only flag it so the
+# dashboard offers "Reconnect" — and the flag clears itself as soon as a poll works.
 async def _background_redirect(_url):
-    # Scheduled polls can't open a browser: session is gone, user must reconnect.
-    meta_del("oauth_tokens", "oauth_expires_at")
-    raise NotConnected("Upwork session expired — click Connect again")
+    raise NotConnected("Upwork session expired — click Reconnect")
 
 
 async def _background_callback():
-    raise NotConnected("Upwork session expired — click Connect again")
+    raise NotConnected("Upwork session expired — click Reconnect")
 
 
 def is_connected():
     return meta_get("oauth_tokens") is not None
+
+
+def needs_reauth():
+    return is_connected() and meta_get("needs_reauth") == "1"
+
+
+def contains_exc(exc, cls, _depth=0):
+    if isinstance(exc, cls):
+        return True
+    if _depth > 8:
+        return False
+    if isinstance(exc, BaseExceptionGroup):
+        return any(contains_exc(e, cls, _depth + 1) for e in exc.exceptions)
+    cause = exc.__cause__ or exc.__context__
+    return bool(cause) and contains_exc(cause, cls, _depth + 1)
 
 
 def err_text(exc):
@@ -236,6 +191,8 @@ def _connect_thread():
         asyncio.run(_connect())
         AUTH["error"] = None
         STATE["last_error"] = None
+        _auth_fail["n"] = 0
+        meta_del("needs_reauth", "reauth_notified")
         log.info("Connected to Upwork")
         threading.Thread(target=poll, daemon=True).start()
     except Exception as exc:
@@ -285,11 +242,12 @@ async def detect_account(session, names, force=False):
     if not talent:
         raise RuntimeError("No Freelancer (talent) account found on this Upwork login")
     _org_cache["uid"] = ORG_UID or talent["org_uid"]
+    meta_set("org_uid", _org_cache["uid"])
     meta_set("account_name", talent.get("name") or "")
     log.info("Using freelancer account %s", talent.get("name"))
 
 
-async def fetch_jobs():
+async def fetch_jobs(s):
     """Run every search in one MCP session; return {job_id: job}."""
     jobs = {}
     auth = make_auth(_background_redirect, _background_callback)
@@ -297,21 +255,24 @@ async def fetch_jobs():
         find_jobs = next(n for n in names if n.endswith("find_jobs"))
         await detect_account(session, names)
 
-        for i, q in enumerate(SEARCHES):
+        for i, q in enumerate(s["searches"]):
             if i:
-                await asyncio.sleep(SEARCH_DELAY_SECONDS)  # spread requests out
+                await asyncio.sleep(s["search_delay_seconds"])  # spread requests out
             params = {"query": q, "sort": "recency", "limit": 10, "include_full_details": True}
-            if VERIFIED_ONLY:
+            if s["verified_only"]:
                 params["verified_payment_only"] = True
             try:
                 data = await _call(session, find_jobs, {
                     "action": "search", "org_uid": _org_cache["uid"], "params": params,
                 })
                 for j in data.get("jobs", []):
-                    jobs.setdefault(j["id"], j)
+                    if j["id"] not in jobs:
+                        jobs[j["id"]] = {**j, "_query": q}
             except Exception as exc:  # one bad query shouldn't kill the cycle...
                 if is_rate_limit(err_text(exc)):  # ...but a rate limit stops everything immediately
                     raise RateLimited(err_text(exc)) from exc
+                if contains_exc(exc, NotConnected):
+                    raise
                 log.warning("Search %r failed: %s", q, exc)
     return jobs
 
@@ -326,6 +287,12 @@ def money(value):
         return 0.0
 
 
+def budget_amount(job):
+    """Highest number in the budget text ('500.00', '$30.00-$60.00/hr'); None if unspecified."""
+    nums = [float(n.replace(",", "")) for n in re.findall(r"\d[\d,]*(?:\.\d+)?", str(job.get("budget") or ""))]
+    return max(nums) if nums else None
+
+
 def parse_dt(value):
     try:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -333,16 +300,59 @@ def parse_dt(value):
         return None
 
 
-def passes_filters(job):
+def keyword_in(text, kw):
+    """Whole-word, case-insensitive match ('ai' does not match 'maintain'; 'c++' works)."""
+    return re.search(rf"(?<!\w){re.escape(kw)}(?!\w)", text, re.I) is not None
+
+
+def evaluate(job, s):
+    """Apply the user's filters. Returns (passes, reason-if-not)."""
     client = job.get("client") or {}
-    if VERIFIED_ONLY and client.get("verification_status") != "VERIFIED":
-        return False
-    if money(client.get("total_spent")) < MIN_CLIENT_SPEND:
-        return False
+    if s["verified_only"] and client.get("verification_status") != "VERIFIED":
+        return False, "Payment method not verified"
+
+    spent = money(client.get("total_spent"))
+    if spent < s["min_client_spend"]:
+        return False, f"Client spent ${spent:,.0f} (min ${s['min_client_spend']:,.0f})"
+
+    rating = client.get("rating")
+    if s["min_client_rating"] and rating and money(rating) < s["min_client_rating"]:
+        return False, f"Client rating {rating} (min {s['min_client_rating']:g})"
+
     pub = parse_dt(job.get("published_date") or job.get("created_date"))
-    if pub and datetime.now(timezone.utc) - pub > timedelta(hours=MAX_AGE_HOURS):
-        return False
-    return True
+    if pub and datetime.now(timezone.utc) - pub > timedelta(hours=s["max_age_hours"]):
+        return False, f"Older than {s['max_age_hours']}h"
+
+    kind = "fixed" if job.get("job_type") == "fixed" else "hourly"
+    if s["job_type"] in ("fixed", "hourly") and kind != s["job_type"]:
+        return False, f"{kind.title()} job (only {s['job_type']} wanted)"
+
+    amount = budget_amount(job)
+    if amount is not None:
+        if kind == "fixed" and amount < s["min_fixed_budget"]:
+            return False, f"Budget ${amount:,.0f} (min ${s['min_fixed_budget']:,.0f})"
+        if kind == "hourly" and amount < s["min_hourly_rate"]:
+            return False, f"Rate ${amount:,.0f}/hr (min ${s['min_hourly_rate']:,.0f})"
+
+    level = (job.get("experience_level") or "").lower()
+    if s["experience_levels"] and level and not any(lv in level for lv in s["experience_levels"]):
+        return False, f"Experience level: {level.replace('_', ' ')}"
+
+    country = (client.get("country") or "").strip().lower()
+    if country:
+        if s["countries_include"] and country not in [c.lower() for c in s["countries_include"]]:
+            return False, f"Client country: {client.get('country')}"
+        if country in [c.lower() for c in s["countries_exclude"]]:
+            return False, f"Excluded country: {client.get('country')}"
+
+    text = " ".join([job.get("title") or "", job.get("description") or job.get("description_snippet") or "",
+                     " ".join(job.get("skills") or [])])
+    for kw in s["exclude_keywords"]:
+        if keyword_in(text, kw):
+            return False, f"Contains excluded word “{kw}”"
+    if s["include_keywords"] and not any(keyword_in(text, kw) for kw in s["include_keywords"]):
+        return False, "Missing required keyword"
+    return True, ""
 
 
 def clean_description(job):
@@ -371,7 +381,7 @@ def job_fields(job):
     c = job.get("client") or {}
     verified = c.get("verification_status") == "VERIFIED"
     rating = f"{c['rating']} ({c.get('total_reviews', 0)} reviews)" if c.get("rating") else "No reviews yet"
-    return [
+    fields = [
         ("Budget", fmt_budget(job)),
         ("Client location", c.get("country") or "Unknown"),
         ("Client spent", c.get("total_spent") or "$0"),
@@ -381,6 +391,9 @@ def job_fields(job):
         ("Experience", (job.get("experience_level") or "n/a").replace("_", " ").title()),
         ("Skills", ", ".join(job.get("skills") or []) or "n/a"),
     ]
+    if job.get("_query"):
+        fields.append(("Matched search", job["_query"]))
+    return fields
 
 
 def render_email(job):
@@ -413,20 +426,40 @@ def render_email(job):
 # --------------------------------------------------------------------------- #
 # Email
 # --------------------------------------------------------------------------- #
-def send_email(subject, text, html_body):
+def send_email(s, subject, text, html_body):
+    if not cfg.smtp_configured(s):
+        raise RuntimeError("Email isn't set up — fill in the SMTP fields under Email & schedule")
     msg = EmailMessage()
-    msg["Subject"], msg["From"], msg["To"] = subject, MAIL_FROM, MAIL_TO
+    msg["Subject"], msg["To"] = subject, s["mail_to"]
+    msg["From"] = s["mail_from"] or s["smtp_user"]
     msg.set_content(text)
     msg.add_alternative(html_body, subtype="html")
-    if SMTP_PORT == 465:
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as s:
-            s.login(SMTP_USER, SMTP_PASS)
-            s.send_message(msg)
+    if s["smtp_port"] == 465:
+        with smtplib.SMTP_SSL(s["smtp_host"], s["smtp_port"], timeout=30) as srv:
+            srv.login(s["smtp_user"], s["smtp_pass"])
+            srv.send_message(msg)
     else:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASS)
-            s.send_message(msg)
+        with smtplib.SMTP(s["smtp_host"], s["smtp_port"], timeout=30) as srv:
+            srv.starttls()
+            srv.login(s["smtp_user"], s["smtp_pass"])
+            srv.send_message(msg)
+
+
+def notify_reauth(s):
+    """One email per outage when the Upwork session can't be refreshed."""
+    if meta_get("reauth_notified") == "1" or not s["email_enabled"] or not cfg.smtp_configured(s):
+        return
+    url = html.escape(PUBLIC_URL, quote=True)
+    try:
+        send_email(
+            s, "⚠️ Upwork Job Alerts needs you to reconnect",
+            f"Your Upwork session couldn't be refreshed, so job checks are paused.\n"
+            f"Open {PUBLIC_URL} and click Reconnect.\n",
+            f'<p>Your Upwork session couldn\'t be refreshed, so job checks are paused.</p>'
+            f'<p><a href="{url}">Open the dashboard</a> and click <b>Reconnect</b>.</p>')
+        meta_set("reauth_notified", "1")
+    except Exception as exc:
+        log.error("Reconnect notice failed: %s", exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -447,49 +480,29 @@ def poll():
     if not _poll_lock.acquire(blocking=False):
         return {"skipped": "previous poll still running"}
     _last_poll_start["t"] = now
+    STATE["polling"] = True
+    s = cfg.load()
     try:
-        jobs = asyncio.run(fetch_jobs())
+        jobs = asyncio.run(fetch_jobs(s))
+        result = process_jobs(jobs, s)
         _backoff.update(until=0.0, seconds=0)
-        STATE["paused_until"] = None
-        STATE["last_found"] = len(jobs)
-        con = db()
-        prune_seen(con)
-        first_run = con.execute("SELECT 1 FROM meta WHERE k='seeded'").fetchone() is None
-
-        if first_run and not EMAIL_ON_FIRST_RUN:
-            for j in jobs.values():
-                mark_seen(con, j)
-            con.execute("INSERT INTO meta VALUES ('seeded','1')")
-            con.commit()
-            log.info("First run: marked %d existing jobs as seen (no emails).", len(jobs))
-            STATE.update(last_poll=datetime.now(timezone.utc).isoformat(), last_error=None)
-            return {"seeded": len(jobs)}
-
-        fresh = [j for j in jobs.values() if not is_seen(con, j["id"]) and passes_filters(j)]
-        fresh.sort(key=lambda j: j.get("published_date") or "")
-        sent = 0
-        for j in fresh:
-            try:
-                send_email(*render_email(j))
-            except Exception as exc:  # leave unseen so it retries next cycle
-                log.error("Email failed for %s: %s", j.get("title"), exc)
-                STATE["last_error"] = f"email: {exc}"
-                continue
-            mark_seen(con, j)
-            sent += 1
-            log.info("Sent: %s", j.get("title"))
-
-        if first_run:
-            con.execute("INSERT OR IGNORE INTO meta VALUES ('seeded','1')")
-            con.commit()
-        STATE["emails_sent"] += sent
-        STATE["last_poll"] = datetime.now(timezone.utc).isoformat()
-        if sent or not STATE["last_error"] or not STATE["last_error"].startswith("email"):
-            STATE["last_error"] = None
-        return {"found": len(jobs), "new_emailed": sent}
+        _auth_fail["n"] = 0
+        meta_del("needs_reauth", "reauth_notified")  # a successful poll proves the session is fine
+        STATE.update(paused_until=None, last_found=len(jobs),
+                     last_poll=db.now_iso(), last_result=result)
+        meta_set("last_poll", STATE["last_poll"])
+        meta_set("last_found", len(jobs))
+        STATE["last_error"] = result.get("email_error")  # None when this cycle was clean
+        return result
     except Exception as exc:
         msg = err_text(exc)
-        if isinstance(exc, RateLimited) or is_rate_limit(msg):
+        if contains_exc(exc, NotConnected):
+            _auth_fail["n"] += 1
+            meta_set("needs_reauth", "1")
+            msg = "Upwork session expired — click Reconnect (the app keeps retrying automatically)"
+            if _auth_fail["n"] >= 2:  # one failure can be a blip; two in a row deserves an email
+                notify_reauth(s)
+        elif isinstance(exc, RateLimited) or is_rate_limit(msg):
             # Back off hard: 15 min, then 30, 60, max 2 h. Never hammer Upwork.
             _backoff["seconds"] = min(max(_backoff["seconds"] * 2, 900), 7200)
             _backoff["until"] = time.time() + _backoff["seconds"]
@@ -497,29 +510,165 @@ def poll():
             msg = f"Upwork rate limit hit — pausing {_backoff['seconds'] // 60} min ({msg})"
         log.error("Poll failed: %s", msg)
         STATE["last_error"] = msg
+        STATE["last_result"] = {"error": msg}
         return {"error": msg}
     finally:
+        STATE["polling"] = False
         _poll_lock.release()
+
+
+def process_jobs(jobs, s):
+    """Store every fetched job, evaluate the new ones, email the matches."""
+    db.prune_jobs()
+    sending = s["email_enabled"]
+    with db.conn() as con:
+        first_run = con.execute("SELECT 1 FROM meta WHERE k='seeded'").fetchone() is None
+        known = db.job_statuses(con, jobs.keys())
+
+        if first_run and not EMAIL_ON_FIRST_RUN:
+            for j in jobs.values():
+                db.upsert_job(con, j, "seeded", "Already online at first run", j.get("_query", ""))
+            con.execute("INSERT OR IGNORE INTO meta VALUES ('seeded','1')")
+            log.info("First run: saved %d existing jobs (no emails).", len(jobs))
+            return {"seeded": len(jobs), "found": len(jobs), "new_emailed": 0}
+
+        matches, filtered = [], 0
+        for j in jobs.values():
+            if known.get(j["id"]) in db.FINAL_STATUSES:
+                continue
+            ok, reason = evaluate(j, s)
+            if ok:
+                matches.append(j)
+            else:
+                filtered += 1
+                db.upsert_job(con, j, "filtered", reason, j.get("_query", ""))
+        con.execute("INSERT OR IGNORE INTO meta VALUES ('seeded','1')")
+
+    matches.sort(key=lambda j: j.get("published_date") or "")
+    sent, email_error = 0, None
+    for j in matches:
+        status, reason = "matched", "Email alerts are off"
+        if sending:
+            try:
+                send_email(s, *render_email(j))
+                status, reason, sent = "emailed", "", sent + 1
+                log.info("Sent: %s", j.get("title"))
+            except Exception as exc:  # stays retryable: status 'failed' is re-evaluated next cycle
+                status, reason = "failed", f"Email failed: {exc}"[:300]
+                email_error = f"email: {exc}"
+                log.error("Email failed for %s: %s", j.get("title"), exc)
+        with db.conn() as con:
+            db.upsert_job(con, j, status, reason, j.get("_query", ""))
+    return {"found": len(jobs), "new_emailed": sent, "matched": len(matches), "filtered": filtered,
+            "email_error": email_error}
+
+
+# --------------------------------------------------------------------------- #
+# Scheduler
+# --------------------------------------------------------------------------- #
+def schedule_poll(seconds, run_now=False):
+    kwargs = {"next_run_time": datetime.now(timezone.utc)} if run_now else {}
+    scheduler.add_job(poll, "interval", seconds=seconds, id="poll", max_instances=1,
+                      coalesce=True, replace_existing=True, **kwargs)
+
+
+# --------------------------------------------------------------------------- #
+# Flask: request guard (the dashboard can change SMTP settings, so protect it)
+# --------------------------------------------------------------------------- #
+def _allowed_hosts():
+    hosts = {"localhost", "127.0.0.1", "::1", urlsplit(PUBLIC_URL).hostname or ""}
+    if HOST not in ("0.0.0.0", "::"):
+        hosts.add(HOST)
+    return hosts
+
+
+@app.before_request
+def guard():
+    # DNS-rebinding protection: only answer for our own host names.
+    host = urlsplit("//" + request.host).hostname
+    if host not in _allowed_hosts():
+        abort(403)
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        # CSRF protection: JSON bodies can't be sent cross-site without a CORS preflight
+        # (which we never allow), and a foreign Origin is rejected outright.
+        origin = request.headers.get("Origin")
+        if origin and urlsplit(origin).netloc != request.host and origin.rstrip("/") != PUBLIC_URL:
+            abort(403)
+        if not request.is_json:
+            abort(415)
 
 
 # --------------------------------------------------------------------------- #
 # Flask routes
 # --------------------------------------------------------------------------- #
-def status_data():
-    return {**STATE, "connected": is_connected(), "account": meta_get("account_name"),
-            "connecting": AUTH["running"], "connect_error": AUTH["error"],
-            "searches": SEARCHES, "poll_seconds": POLL_SECONDS, "mail_to": MAIL_TO,
-            "smtp_configured": bool(SMTP_USER and SMTP_PASS)}
+def state_data():
+    s = cfg.load()
+    counts = db.job_counts()
+    nxt = scheduler.get_job("poll")
+    return {
+        **STATE,
+        "connected": is_connected(), "needs_reauth": needs_reauth(),
+        "account": meta_get("account_name"),
+        "connecting": AUTH["running"], "connect_error": AUTH["error"],
+        "poll_seconds": s["poll_seconds"],
+        "requests_per_hour": len(s["searches"]) * 3600 // s["poll_seconds"],
+        "next_poll": nxt.next_run_time.isoformat() if nxt and nxt.next_run_time else None,
+        "smtp_configured": cfg.smtp_configured(s), "email_enabled": s["email_enabled"],
+        "mail_to": s["mail_to"], "counts": counts, "emails_sent": counts.get("emailed", 0),
+        "total_jobs": sum(counts.values()),
+    }
 
 
 @app.get("/")
 def dashboard():
-    return render_template_string(DASHBOARD_HTML, s=status_data())
+    return render_template("index.html")
 
 
 @app.get("/status")
-def status():
-    return jsonify(status_data())
+@app.get("/api/state")
+def api_state():
+    return jsonify(state_data())
+
+
+@app.get("/api/settings")
+def api_settings_get():
+    return jsonify(cfg.public(cfg.load()))
+
+
+@app.post("/api/settings")
+def api_settings_save():
+    current = cfg.load()
+    new, to_store, errors = cfg.validate(request.get_json(silent=True) or {}, current)
+    if errors:
+        return jsonify({"error": "; ".join(errors)}), 400
+    db.settings_save(to_store)
+    if new["poll_seconds"] != current["poll_seconds"] and scheduler.running:
+        schedule_poll(new["poll_seconds"])
+    log.info("Settings saved from the dashboard")
+    return jsonify(cfg.public(new))
+
+
+def _job_row(r):
+    j = json.loads(r["data"] or "{}")
+    c = j.get("client") or {}
+    return {
+        "id": r["job_id"], "title": r["title"] or "(untitled)", "status": r["status"],
+        "reason": r["reason"], "query": r["query"], "found_at": r["found_at"],
+        "published_at": r["published_at"],
+        "url": clean_url(r["url"]) if r["url"] else "",
+        "budget": fmt_budget(j) if j else "", "country": c.get("country") or "",
+        "spent": c.get("total_spent") or "", "verified": c.get("verification_status") == "VERIFIED",
+        "skills": (j.get("skills") or [])[:6],
+    }
+
+
+@app.get("/api/jobs")
+def api_jobs():
+    status = request.args.get("status") or None
+    limit = min(max(request.args.get("limit", 50, type=int), 1), 200)
+    offset = max(request.args.get("offset", 0, type=int), 0)
+    total, rows = db.jobs_list(status, limit, offset)
+    return jsonify({"total": total, "jobs": [_job_row(r) for r in rows]})
 
 
 @app.get("/connect")
@@ -545,20 +694,26 @@ def oauth_callback():
     return redirect("/")
 
 
-@app.post("/disconnect")
-def disconnect():
-    meta_del("oauth_tokens", "oauth_expires_at", "account_name")
+@app.post("/api/disconnect")
+def api_disconnect():
+    meta_del("oauth_tokens", "oauth_expires_at", "account_name", "org_uid", "needs_reauth", "reauth_notified")
     _org_cache["uid"] = ORG_UID
-    return redirect("/")
+    return jsonify({"ok": True})
 
 
-@app.get("/poll")
-def poll_now():
-    return jsonify(poll())
+@app.post("/api/poll")
+def api_poll():
+    """Start a check in the background; answer immediately if it was refused, or after 2 s."""
+    box = {}
+    t = threading.Thread(target=lambda: box.update(poll()), daemon=True)
+    t.start()
+    t.join(2)
+    return jsonify(box or {"started": True})
 
 
-@app.get("/test-email")
-def test_email():
+@app.post("/api/test-email")
+def api_test_email():
+    s = cfg.load()
     sample = {
         "id": "test", "title": "Test job: Senior Django/FastAPI developer", "job_type": "fixed",
         "budget": "500.00", "url": "https://www.upwork.com/jobs/~0123456789?utm_source=x",
@@ -566,120 +721,26 @@ def test_email():
         "client": {"country": "United States", "total_spent": "$12,400.00", "rating": 4.8,
                    "total_reviews": 14, "verification_status": "VERIFIED"},
         "proposals_tier": "5 to 10", "experience_level": "expert", "skills": ["Python", "Django"],
+        "_query": "Django",
     }
     try:
-        send_email(*render_email(sample))
-        return jsonify({"ok": True, "sent_to": MAIL_TO})
+        send_email(s, *render_email(sample))
+        return jsonify({"ok": True, "sent_to": s["mail_to"]})
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
-DASHBOARD_HTML = """<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Upwork Job Alerts — Dashboard</title>
-<meta name="description" content="Connect your Upwork account and get instant email alerts for new matching jobs.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<style>
-:root{--bg:#0b0f0c;--card:rgba(255,255,255,.04);--line:rgba(255,255,255,.08);--txt:#e8f0ea;--mut:#8a9a8f;
- --g:#14a800;--g2:#3ddc84;--red:#ff6b6b;--amb:#f5b942}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;font-family:Inter,system-ui,sans-serif;color:var(--txt);
- background:radial-gradient(900px 500px at 10% -10%,rgba(20,168,0,.25),transparent 60%),
- radial-gradient(700px 400px at 110% 10%,rgba(61,220,132,.12),transparent 60%),var(--bg)}
-main{max-width:880px;margin:0 auto;padding:48px 20px 64px}
-header{display:flex;align-items:center;gap:14px;margin-bottom:32px}
-.logo{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;font-weight:800;font-size:20px;
- background:linear-gradient(135deg,var(--g),var(--g2));box-shadow:0 8px 30px rgba(20,168,0,.4)}
-h1{font-size:24px;margin:0;letter-spacing:-.02em}header p{margin:2px 0 0;color:var(--mut);font-size:14px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:24px;backdrop-filter:blur(12px);
- margin-bottom:18px;animation:up .5s ease both}
-@keyframes up{from{opacity:0;transform:translateY(8px)}}
-.conn{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
-.dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:8px;background:var(--red)}
-.on .dot{background:var(--g2);box-shadow:0 0 0 0 rgba(61,220,132,.6);animation:pulse 2s infinite}
-@keyframes pulse{70%{box-shadow:0 0 0 10px rgba(61,220,132,0)}100%{box-shadow:0 0 0 0 rgba(61,220,132,0)}}
-h2{font-size:18px;margin:0 0 4px}.mut{color:var(--mut);font-size:14px;margin:0}
-.btn{appearance:none;border:0;cursor:pointer;font:600 15px Inter,sans-serif;color:#fff;text-decoration:none;
- padding:12px 22px;border-radius:12px;display:inline-flex;align-items:center;gap:8px;transition:transform .15s,box-shadow .2s,background .2s}
-.btn:hover{transform:translateY(-1px)}.btn:active{transform:none}
-.primary{background:linear-gradient(135deg,var(--g),#1fbf3a);box-shadow:0 8px 24px rgba(20,168,0,.35)}
-.primary:hover{box-shadow:0 12px 32px rgba(20,168,0,.5)}
-.ghost{background:rgba(255,255,255,.06);border:1px solid var(--line)}.ghost:hover{background:rgba(255,255,255,.1)}
-.danger{background:transparent;color:var(--red);border:1px solid rgba(255,107,107,.3)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px}
-.stat b{display:block;font-size:26px;letter-spacing:-.02em;margin-top:6px}.stat span{color:var(--mut);font-size:13px}
-.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
-.chip{padding:6px 12px;border-radius:999px;font-size:13px;background:rgba(20,168,0,.12);border:1px solid rgba(20,168,0,.3);color:#b6f5c4}
-.alert{padding:12px 16px;border-radius:12px;font-size:14px;margin-bottom:18px;border:1px solid}
-.err{background:rgba(255,107,107,.08);border-color:rgba(255,107,107,.3);color:#ffb3b3}
-.warn{background:rgba(245,185,66,.08);border-color:rgba(245,185,66,.3);color:#ffd98a}
-.row{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}
-#toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(80px);background:#16201a;
- border:1px solid var(--line);padding:12px 18px;border-radius:12px;font-size:14px;transition:transform .3s;max-width:90vw}
-#toast.show{transform:translateX(-50%) translateY(0)}
-</style></head><body><main>
-<header><div class="logo">U</div><div><h1>Upwork Job Alerts</h1>
-<p>New jobs matching your stack, straight to your inbox.</p></div></header>
-
-{% if s.connect_error %}<div class="alert err">Connection failed: {{ s.connect_error }}</div>{% endif %}
-{% if s.last_error %}<div class="alert err">Last error: {{ s.last_error }}</div>{% endif %}
-{% if not s.smtp_configured %}<div class="alert warn">Email isn't set up yet — add SMTP_USER / SMTP_PASS / MAIL_TO to .env so alerts can be sent.</div>{% endif %}
-
-<section class="card conn {{ 'on' if s.connected }}">
-  <div>
-    <h2><span class="dot"></span>{{ 'Connected to Upwork' if s.connected else 'Not connected' }}</h2>
-    <p class="mut">{% if s.connected %}{{ s.account or 'Freelancer account' }} · checking every {{ s.poll_seconds }}s
-    {% else %}Sign in with Upwork in your browser — no API keys or tokens needed.{% endif %}</p>
-  </div>
-  {% if s.connected %}
-  <form method="post" action="/disconnect"><button id="disconnect-btn" class="btn danger">Disconnect</button></form>
-  {% else %}
-  <a id="connect-btn" class="btn primary" href="/connect">{{ 'Connecting…' if s.connecting else 'Connect Upwork' }} →</a>
-  {% endif %}
-</section>
-
-<section class="grid">
-  <div class="card stat"><span>Jobs found (last check)</span><b>{{ s.last_found }}</b></div>
-  <div class="card stat"><span>Alerts emailed</span><b>{{ s.emails_sent }}</b></div>
-  <div class="card stat"><span>Last check</span><b id="last-poll" data-ts="{{ s.last_poll or '' }}">—</b></div>
-</section>
-
-<section class="card">
-  <h2>Watching</h2><p class="mut">Alerts go to {{ s.mail_to or '(MAIL_TO not set)' }}</p>
-  <div class="chips">{% for q in s.searches %}<span class="chip">{{ q }}</span>{% endfor %}</div>
-  <div class="row">
-    <button id="poll-btn" class="btn ghost" data-url="/poll" {{ 'disabled' if not s.connected }}>Check now</button>
-    <button id="test-email-btn" class="btn ghost" data-url="/test-email">Send test email</button>
-  </div>
-</section>
-</main><div id="toast" role="status"></div>
-<script>
-const ts=document.getElementById('last-poll');
-if(ts.dataset.ts){const d=new Date(ts.dataset.ts);ts.textContent=d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});}
-const toast=m=>{const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3500)};
-document.querySelectorAll('[data-url]').forEach(b=>b.addEventListener('click',async()=>{
-  const label=b.textContent;b.disabled=true;b.textContent='Working…';
-  try{const r=await (await fetch(b.dataset.url)).json();
-    toast(r.error?'Error: '+r.error:r.skipped?r.skipped:r.ok===false?'Error':
-      r.sent_to?'Test email sent to '+r.sent_to:r.seeded!==undefined?'Saved '+r.seeded+' existing jobs':
-      'Found '+r.found+' jobs, emailed '+r.new_emailed);
-    if(b.id==='poll-btn')setTimeout(()=>location.reload(),1500);
-  }catch(e){toast('Request failed')}finally{b.disabled=false;b.textContent=label}}));
-{% if s.connecting %}setTimeout(()=>location.reload(),3000);{% endif %}
-</script></body></html>"""
+def main():
+    s = cfg.load()
+    if not cfg.smtp_configured(s):
+        log.warning("Email isn't configured yet — set it up in the dashboard (Email & schedule)")
+    schedule_poll(s["poll_seconds"], run_now=True)
+    scheduler.start()
+    log.info("Polling %d searches every %ss (~%d Upwork requests/hour) — database: %s",
+             len(s["searches"]), s["poll_seconds"], len(s["searches"]) * 3600 // s["poll_seconds"], db.DB_PATH)
+    log.info("Open %s %s", PUBLIC_URL, "(connected)" if is_connected() else "and click 'Connect Upwork'")
+    app.run(host=HOST, port=PORT, use_reloader=False, threaded=True)
 
 
 if __name__ == "__main__":
-    if not (SMTP_USER and SMTP_PASS):
-        log.warning("SMTP_USER / SMTP_PASS not set — alerts can't be emailed until you add them to .env")
-    if int(os.getenv("POLL_SECONDS", "600")) < MIN_POLL_SECONDS:
-        log.warning("POLL_SECONDS raised to %ss (safety minimum)", MIN_POLL_SECONDS)
-    scheduler = BackgroundScheduler(timezone="UTC")
-    scheduler.add_job(poll, "interval", seconds=POLL_SECONDS, max_instances=1, coalesce=True,
-                      next_run_time=datetime.now(timezone.utc))
-    scheduler.start()
-    log.info("Polling %d searches every %ss (~%d Upwork requests/hour)",
-             len(SEARCHES), POLL_SECONDS, len(SEARCHES) * 3600 // POLL_SECONDS)
-    log.info("Open %s and click 'Connect Upwork'", PUBLIC_URL)
-    app.run(host=HOST, port=PORT, use_reloader=False, threaded=True)
+    main()

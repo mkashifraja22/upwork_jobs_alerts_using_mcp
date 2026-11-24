@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Upwork Job Alerts — Dashboard</title>
+<meta name="description" content="Connect your Upwork account and get instant email alerts for new matching jobs.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head><body><main>
+
+<header><div class="logo">U</div><div><h1>Upwork Job Alerts</h1>
+<p>New jobs matching your stack, straight to your inbox.</p></div></header>
+
+<div id="banners"></div>
+
+<section class="card conn" id="conn">
+  <div>
+    <h2><span class="dot"></span><span id="conn-title">Loading…</span></h2>
+    <p class="mut" id="conn-sub"></p>
+  </div>
+  <div id="conn-actions"></div>
+</section>
+
+<section class="grid">
+  <div class="card stat"><span>Jobs found (last check)</span><b id="st-found">—</b></div>
+  <div class="card stat"><span>Alerts emailed</span><b id="st-sent">—</b></div>
+  <div class="card stat"><span>Last check</span><b id="st-last">—</b></div>
+  <div class="card stat"><span>Next check</span><b id="st-next">—</b></div>
+</section>
+
+<nav class="tabs" role="tablist">
+  <button class="tab active" data-tab="jobs" role="tab">Recent jobs</button>
+  <button class="tab" data-tab="filters" role="tab">Keywords &amp; filters</button>
+  <button class="tab" data-tab="email" role="tab">Email &amp; schedule</button>
+  <div class="tab-actions">
+    <button id="poll-btn" class="btn ghost sm">Check now</button>
+  </div>
+</nav>
+
+<!-- ───────── Recent jobs ───────── -->
+<section class="card pane" id="pane-jobs">
+  <div class="jobs-head">
+    <h2>Recent jobs</h2>
+    <select id="job-status" aria-label="Filter by status">
+      <option value="">All</option>
+      <option value="emailed">Emailed</option>
+      <option value="matched">Matched (email off)</option>
+      <option value="filtered">Filtered out</option>
+      <option value="failed">Email failed</option>
+      <option value="seeded">Existing at first run</option>
+    </select>
+  </div>
+  <p class="mut">Every job the app has seen in the last 30 days, and why it was or wasn't sent — handy for tuning your filters.</p>
+  <div id="job-list" class="job-list"></div>
+  <div class="row"><button id="more-btn" class="btn ghost sm" hidden>Load more</button></div>
+</section>
+
+<form id="settings-form" autocomplete="off" novalidate>
+
+<!-- ───────── Keywords & filters ───────── -->
+<section class="card pane" id="pane-filters" hidden>
+  <h2>Keywords</h2>
+  <label class="field">
+    <span class="lbl">Search keywords <i class="hint" id="rate-hint"></i></span>
+    <div class="tags" data-name="searches" data-ph="e.g. Django, FastAPI, HubSpot…"></div>
+    <small>Each keyword is a separate Upwork search. Press Enter or comma to add.</small>
+  </label>
+  <div class="two">
+    <label class="field">
+      <span class="lbl">Must mention one of <i class="hint">optional</i></span>
+      <div class="tags" data-name="include_keywords" data-ph="Only alert if any appears…"></div>
+      <small>Checked in the title, description and skills (whole words).</small>
+    </label>
+    <label class="field">
+      <span class="lbl">Never alert if it mentions</span>
+      <div class="tags" data-name="exclude_keywords" data-ph="e.g. WordPress, PHP, unpaid…"></div>
+      <small>Great for noise: a single excluded word hides the job.</small>
+    </label>
+  </div>
+
+  <h2 class="gap">Filters</h2>
+  <div class="grid3">
+    <label class="field"><span class="lbl">Job type</span>
+      <select name="job_type"><option value="any">Fixed &amp; hourly</option><option value="fixed">Fixed price only</option><option value="hourly">Hourly only</option></select></label>
+    <label class="field"><span class="lbl">Min fixed budget ($)</span><input type="number" name="min_fixed_budget" min="0" step="10"></label>
+    <label class="field"><span class="lbl">Min hourly rate ($/hr)</span><input type="number" name="min_hourly_rate" min="0" step="1"></label>
+    <label class="field"><span class="lbl">Min client total spend ($)</span><input type="number" name="min_client_spend" min="0" step="100"></label>
+    <label class="field"><span class="lbl">Min client rating (0–5)</span><input type="number" name="min_client_rating" min="0" max="5" step="0.1"></label>
+    <label class="field"><span class="lbl">Max job age (hours)</span><input type="number" name="max_age_hours" min="1" max="720" step="1"></label>
+  </div>
+  <div class="two">
+    <div class="field"><span class="lbl">Experience level <i class="hint">none ticked = any</i></span>
+      <div class="checks">
+        <label><input type="checkbox" name="experience_levels" value="entry"> Entry</label>
+        <label><input type="checkbox" name="experience_levels" value="intermediate"> Intermediate</label>
+        <label><input type="checkbox" name="experience_levels" value="expert"> Expert</label>
+      </div></div>
+    <div class="field"><span class="lbl">Payment</span>
+      <label class="switch"><input type="checkbox" name="verified_only"><span></span> Verified payment method only</label></div>
+  </div>
+  <div class="two">
+    <label class="field"><span class="lbl">Only these client countries <i class="hint">empty = any</i></span>
+      <div class="tags" data-name="countries_include" data-ph="e.g. United States, Canada…"></div></label>
+    <label class="field"><span class="lbl">Skip these client countries</span>
+      <div class="tags" data-name="countries_exclude" data-ph="e.g. India…"></div></label>
+  </div>
+</section>
+
+<!-- ───────── Email & schedule ───────── -->
+<section class="card pane" id="pane-email" hidden>
+  <h2>Email alerts</h2>
+  <label class="switch big"><input type="checkbox" name="email_enabled"><span></span> Send an email for every matching job</label>
+  <div class="two">
+    <label class="field"><span class="lbl">Send alerts to</span><input type="text" name="mail_to" placeholder="you@example.com"><small>Separate several addresses with commas.</small></label>
+    <label class="field"><span class="lbl">From address <i class="hint">optional</i></span><input type="text" name="mail_from" placeholder="same as SMTP user"></label>
+  </div>
+  <div class="grid3">
+    <label class="field"><span class="lbl">SMTP host</span><input type="text" name="smtp_host" placeholder="smtp.gmail.com"></label>
+    <label class="field"><span class="lbl">SMTP port</span><input type="number" name="smtp_port" min="1" max="65535"></label>
+    <label class="field"><span class="lbl">SMTP user</span><input type="text" name="smtp_user" placeholder="you@gmail.com"></label>
+  </div>
+  <label class="field"><span class="lbl">SMTP password <i class="hint" id="pass-hint"></i></span>
+    <input type="password" name="smtp_pass" autocomplete="new-password" placeholder="Leave blank to keep the saved password">
+    <small>Gmail: use an <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener">App Password</a>, not your normal password. It's stored only in this app's local database.</small></label>
+  <div class="row"><button type="button" id="test-email-btn" class="btn ghost sm">Send test email</button>
+    <small class="mut">Uses the saved settings — save first if you changed them.</small></div>
+
+  <h2 class="gap">Schedule</h2>
+  <div class="two">
+    <label class="field"><span class="lbl">Check Upwork every (minutes)</span><input type="number" name="poll_minutes" min="5" max="1440" step="1">
+      <small>Minimum 5 — kept gentle on purpose to protect your Upwork account.</small></label>
+    <label class="field"><span class="lbl">Pause between searches (seconds)</span><input type="number" name="search_delay_seconds" min="1" max="60" step="1"></label>
+  </div>
+</section>
+
+<div class="savebar" id="savebar" hidden>
+  <span id="save-msg">Unsaved changes</span>
+  <button type="button" id="discard-btn" class="btn ghost sm">Discard</button>
+  <button type="submit" id="save-btn" class="btn primary sm">Save changes</button>
+</div>
+</form>
+
+</main><div id="toast" role="status"></div>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body></html>

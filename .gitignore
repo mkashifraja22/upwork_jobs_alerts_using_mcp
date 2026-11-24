@@ -1,4 +1,6 @@
 .env
 jobs.db
+jobs.db-wal
+jobs.db-shm
 venv/
 __pycache__/
